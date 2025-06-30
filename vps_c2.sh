@@ -1,13 +1,13 @@
 #!/bin/bash
 
-echo "[*] Updating packages..."
+echo "[*] Updating system..."
 sudo apt update && sudo apt upgrade -y
 
-echo "[*] Installing Python3, pip, and Flask..."
+echo "[*] Installing Python and Flask..."
 sudo apt install -y python3 python3-pip ufw
 pip3 install flask
 
-echo "[*] Creating C2 directory..."
+echo "[*] Creating C2 directory structure..."
 mkdir -p ~/c2_server/certs
 cd ~/c2_server
 
@@ -53,35 +53,25 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8443, ssl_context=context)
 EOF
 
-echo "[*] Generating self-signed HTTPS certificate..."
+echo "[*] Generating self-signed TLS certificate..."
 openssl req -new -x509 -days 365 -nodes \
     -out certs/cert.pem -keyout certs/key.pem \
     -subj "/C=IN/ST=RedTeam/L=CyberOps/O=C2Project/CN=$(curl -s ifconfig.me)"
 
-echo "[*] Configuring UFW to allow port 8443..."
+echo "[*] Creating manual start script..."
+cat > start_c2.sh << 'EOF'
+#!/bin/bash
+cd "$(dirname "$0")"
+nohup python3 server.py > c2.log 2>&1 &
+echo "[+] C2 server started. Check logs: c2.log"
+EOF
+
+chmod +x start_c2.sh
+
+echo "[*] Allowing required ports through UFW..."
+sudo ufw allow 22
 sudo ufw allow 8443
 sudo ufw --force enable
 
-echo "[*] Creating systemd service for C2..."
-cat | sudo tee /etc/systemd/system/c2server.service > /dev/null << EOF
-[Unit]
-Description=Custom C2 Flask Server
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/python3 /home/ubuntu/c2_server/server.py
-WorkingDirectory=/home/ubuntu/c2_server
-Restart=always
-User=ubuntu
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "[*] Enabling and starting C2 service..."
-sudo systemctl daemon-reexec
-sudo systemctl daemon-reload
-sudo systemctl enable c2server
-sudo systemctl start c2server
-
-echo "[✔] C2 Server is now running on https://$(curl -s ifconfig.me):8443"
+echo "[✔] Setup complete. To start your C2 server, run:"
+echo "     ~/c2_server/start_c2.sh"
